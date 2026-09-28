@@ -2,12 +2,16 @@
 //  VibeChat — Main App Module
 // ============================================================
 
-import { auth, db, storage, ADMIN_UIDS, OWNER_USERNAMES, TENOR_API_KEY } from "./firebase-config.js";
+import { auth, db, ADMIN_UIDS, OWNER_USERNAMES, VAPID_KEY } from "./firebase-config.js";
+import { initGames, closeGame } from "./games.js";
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  updatePassword,
+  reauthenticateWithCredential,
+  EmailAuthProvider
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 import {
   ref,
@@ -27,13 +31,9 @@ import {
   limitToLast,
   off
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
-import {
-  ref as storageRef,
-  uploadBytesResumable,
-  getDownloadURL
-} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 
 // ============ STATE ============
+console.log("VibeChat build: avatars-1");
 let currentUser = null;
 let currentRoom = null;
 let currentRoomId = null;
@@ -41,6 +41,28 @@ let isAdmin = false;
 let isOwner = false;
 let isBanned = false;
 let adminUids = new Set(ADMIN_UIDS);
+let userCache = {};
+let mentionCounts = {};
+let currentPresence = {};
+let mentionMenuState = { open: false, items: [], highlight: 0 };
+
+const ANNOUNCEMENTS_ID = "announcements";
+
+// One-time migration: the old pinned announcements room (if any) moves to
+// the dedicated announcements feed, then the legacy room is removed.
+async function migrateAnnouncements() {
+  try {
+    const legacy = await get(ref(db, `rooms/${ANNOUNCEMENTS_ID}`));
+    if (!legacy.exists()) return;
+    const msgs = legacy.val()?.messages || {};
+    for (const [id, m] of Object.entries(msgs)) {
+      await set(ref(db, `announcements/messages/${id}`), m);
+    }
+    await remove(ref(db, `rooms/${ANNOUNCEMENTS_ID}`));
+  } catch (err) {
+    console.error("Announcements migration failed:", err);
+  }
+}
 let presenceRef = null;
 let typingRef = null;
 let messageListeners = [];
@@ -65,7 +87,9 @@ const screens = {
   auth: $("auth-screen"),
   lobby: $("lobby-screen"),
   chat: $("chat-screen"),
-  admin: $("admin-screen")
+  admin: $("admin-screen"),
+  games: $("games-screen"),
+  announcements: $("announcements-screen")
 };
 
 // ============ UTILITIES ============
@@ -74,11 +98,11 @@ function showScreen(name) {
   screens[name].classList.add("active");
 }
 
-function showToast(msg, type = "success") {
+function showToast(msg, type = "success", ms = 3000) {
   const toast = $("toast");
   toast.textContent = msg;
   toast.className = `toast ${type}`;
-  setTimeout(() => toast.classList.add("hidden"), 3000);
+  setTimeout(() => toast.classList.add("hidden"), ms);
 }
 
 function showError(msg) {
@@ -90,7 +114,30 @@ function clearError() {
 }
 
 function usernameToEmail(username) {
-  return `${username.toLowerCase().replace(/[^a-z0-9]/g, "")}@vibechat.app`;
+  return `${normalizeName(username)}@vibechat.app`;
+}
+
+function normalizeName(username) {
+  return (username || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Display names live in users/{uid} + usernames/{key}; the Auth email
+// (built from the ORIGINAL signup name) never changes, so renames are
+// database-only and can't hit Firebase's email-change restrictions.
+async function ensureUsernameIndex(key, uid) {
+  if (!key) return;
+  try {
+    const snap = await get(ref(db, `usernames/${key}`));
+    const hit = snap.val();
+    const owner = typeof hit === "string" ? hit : hit?.uid;
+    if (!snap.exists() || owner === uid) {
+      await set(ref(db, `usernames/${key}`), uid);
+    } else {
+      console.warn("Username index collision, skipping:", key);
+    }
+  } catch (err) {
+    console.error("Username index backfill failed:", err);
+  }
 }
 
 function isOwnerName(name) {
@@ -109,6 +156,66 @@ async function refreshAdminList() {
   }
 }
 
+// Refresh the uid -> { username, photoURL } cache for avatars
+async function refreshUserCache() {
+  try {
+    const snap = await get(ref(db, "users"));
+    userCache = snap.val() || {};
+  } catch (err) {
+    console.error("User cache refresh failed:", err);
+  }
+}
+
+function avatarHue(name) {
+  let h = 0;
+  for (const c of (name || "?")) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+
+function avatarInner(name, photo) {
+  if (photo) return `<img src="${escapeHtml(photo)}" alt="" />`;
+  const initial = ((name || "?").trim().charAt(0) || "?").toUpperCase();
+  return `<span class="avatar-initial" style="background:hsl(${avatarHue(name)},45%,45%)">${escapeHtml(initial)}</span>`;
+}
+
+function paintAvatars(uid) {
+  const profile = userCache[uid] || {};
+  document.querySelectorAll(`.avatar[data-uid="${uid}"]`).forEach(el => {
+    el.innerHTML = avatarInner(el.dataset.name || profile.username || "?", profile.photoURL);
+  });
+}
+
+function paintHeaderAvatar() {
+  const el = $("header-avatar");
+  if (!el || !currentUser) return;
+  el.dataset.uid = currentUser.uid;
+  el.dataset.name = getUsername();
+  el.innerHTML = avatarInner(getUsername(), (userCache[currentUser.uid] || {}).photoURL);
+}
+
+// Downscale an image file to a small square JPEG data URL (no Storage needed)
+function processAvatar(file) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const size = 128;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const side = Math.min(img.width, img.height);
+      canvas.getContext("2d").drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+      resolve(canvas.toDataURL("image/jpeg", 0.8));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("Could not read image"));
+    };
+    img.src = objectUrl;
+  });
+}
+
 function formatTime(ts) {
   if (!ts) return "";
   const d = new Date(ts);
@@ -121,9 +228,177 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-function linkify(text) {
-  const urlRegex = /(https?:\/\/[^\s]+)/g;
-  return escapeHtml(text).replace(urlRegex, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+const URL_RE = /(https?:\/\/[^\s<]+)/g;
+const MENTION_RE = /@([A-Za-z0-9_][A-Za-z0-9_ |.\-]{2,19})/g;
+
+function findUserByName(name) {
+  const want = (name || "").trim().toLowerCase().replace(/[ .|\-]+$/, "");
+  if (!want) return null;
+  for (const [uid, u] of Object.entries(userCache)) {
+    if ((u.username || "").toLowerCase() === want) return { uid, username: u.username };
+  }
+  return null;
+}
+
+function extractMentionedUids(text, senderIsOwner) {
+  const uids = new Set();
+  const raw = text || "";
+  // @everyone: owner-only broadcast to every known user
+  if (senderIsOwner && /(?:^|\s)@everyone(?![A-Za-z0-9_])/i.test(raw) && currentUser) {
+    for (const uid of Object.keys(userCache)) {
+      if (uid !== currentUser.uid) uids.add(uid);
+    }
+  }
+  raw.replace(MENTION_RE, (m, name) => {
+    const hit = findUserByName(name);
+    if (hit && currentUser && hit.uid !== currentUser.uid) uids.add(hit.uid);
+    return m;
+  });
+  return [...uids];
+}
+
+function messageMentionsMe(msg) {
+  const text = msg?.text || "";
+  // Owner-sent @everyone pings every viewer
+  if (isOwnerName(msg?.username) && /(?:^|\s)@everyone(?![A-Za-z0-9_])/i.test(text)) return true;
+  const myName = getUsername().toLowerCase();
+  let found = false;
+  text.replace(MENTION_RE, (m, name) => {
+    const hit = findUserByName(name);
+    if (hit && hit.username.toLowerCase() === myName) found = true;
+    return m;
+  });
+  return found;
+}
+
+function renderMessageText(raw, everyoneActive = false) {
+  const esc = escapeHtml(raw || "");
+  const urls = [];
+  const noUrls = esc.replace(URL_RE, (m) => {
+    urls.push(m);
+    return `\u0000${urls.length - 1}\u0000`;
+  });
+  const myName = getUsername().toLowerCase();
+  const withMentions = noUrls.replace(MENTION_RE, (m, name) => {
+    const trimmed = name.trim().replace(/[ .|\-]+$/, "");
+    if (everyoneActive && trimmed.toLowerCase() === "everyone") {
+      return `<span class="mention me">@everyone</span>`;
+    }
+    const hit = findUserByName(name);
+    if (!hit) return m;
+    const me = hit.username.toLowerCase() === myName;
+    return `<span class="mention${me ? " me" : ""}">@${escapeHtml(hit.username)}</span>`;
+  });
+  return withMentions.replace(/\u0000(\d+)\u0000/g, (_, i) => {
+    const u = urls[+i];
+    return `<a href="${u}" target="_blank" rel="noopener">${u}</a>`;
+  });
+}
+
+// ============ MENTION AUTOCOMPLETE MENU ============
+function getMentionQuery() {
+  const input = $("message-input");
+  if (!input) return null;
+  const uptoCaret = input.value.slice(0, input.selectionStart ?? input.value.length);
+  const m = /(?:^|\s)@([A-Za-z0-9_ |.\-]*)$/.exec(uptoCaret);
+  if (!m) return null;
+  return { query: m[1], start: uptoCaret.length - m[1].length - 1 };
+}
+
+function hideMentionMenu() {
+  mentionMenuState.open = false;
+  $("mention-menu").classList.add("hidden");
+}
+
+function setMentionHighlight(i) {
+  mentionMenuState.highlight = i;
+  document.querySelectorAll("#mention-menu .mention-row").forEach((row, j) => {
+    row.classList.toggle("selected", j === i);
+    if (j === i) row.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function updateMentionMenu() {
+  const menu = $("mention-menu");
+  const q = currentRoomId && currentUser ? getMentionQuery() : null;
+  if (!q) {
+    hideMentionMenu();
+    return;
+  }
+  const query = q.query.toLowerCase();
+  const onlineItems = Object.entries(currentPresence)
+    .filter(([uid, u]) => uid !== currentUser.uid && (u.username || "").toLowerCase().includes(query))
+    .map(([uid, u]) => ({ uid, username: u.username, online: true }));
+  const seen = new Set(onlineItems.map(i => i.uid));
+  seen.add(currentUser.uid);
+  const otherItems = Object.entries(userCache)
+    .filter(([uid, u]) => !seen.has(uid) && (u.username || "").toLowerCase().includes(query))
+    .map(([uid, u]) => ({ uid, username: u.username, online: false }));
+  let items = [...onlineItems, ...otherItems];
+  if (isOwner && "everyone".includes(query)) {
+    items.unshift({ uid: null, username: "everyone", online: true, everyone: true });
+  }
+  items = items.slice(0, 8);
+  mentionMenuState = { open: true, items, highlight: 0 };
+  menu.innerHTML = "<h4>Members</h4>";
+  if (!items.length) {
+    menu.innerHTML += '<p class="mention-empty">No matches</p>';
+  } else {
+    items.forEach((item, i) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "mention-row" + (i === 0 ? " selected" : "") + (item.online ? "" : " offline");
+      if (item.everyone) {
+        row.innerHTML = `<span style="font-size:1.1rem">📣</span> <b>everyone</b> <span style="color:var(--text-secondary);font-size:0.8rem">Notify everyone</span>`;
+      } else {
+        const photo = (userCache[item.uid] || {}).photoURL;
+        row.innerHTML = `<span class="avatar" data-uid="${escapeHtml(item.uid)}" data-name="${escapeHtml(item.username)}">${avatarInner(item.username, photo)}</span> ${escapeHtml(item.username)}`;
+      }
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        completeMention(item.username);
+      });
+      row.addEventListener("mouseenter", () => setMentionHighlight(i));
+      menu.appendChild(row);
+    });
+  }
+  menu.classList.remove("hidden");
+}
+
+function completeMention(username) {
+  const input = $("message-input");
+  const q = getMentionQuery();
+  hideMentionMenu();
+  if (!q) return;
+  const before = input.value.slice(0, q.start);
+  const after = input.value.slice(input.selectionStart ?? input.value.length);
+  const insert = `@${username} `;
+  input.value = before + insert + after;
+  const pos = before.length + insert.length;
+  input.setSelectionRange(pos, pos);
+  input.focus();
+}
+
+function mentionMenuKey(e) {
+  if (!mentionMenuState.open) return;
+  const items = mentionMenuState.items;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (items.length) setMentionHighlight((mentionMenuState.highlight + 1) % items.length);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (items.length) setMentionHighlight((mentionMenuState.highlight - 1 + items.length) % items.length);
+  } else if (e.key === "Enter" || e.key === "Tab") {
+    if (items.length) {
+      e.preventDefault();
+      completeMention(items[mentionMenuState.highlight].username);
+    } else {
+      hideMentionMenu();
+    }
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    hideMentionMenu();
+  }
 }
 
 // ============ AUTH ============
@@ -144,6 +419,8 @@ function initAuth() {
       loadUserProfile();
     } else {
       detachActiveListeners();
+      stopNotifListeners();
+      closeAnnListeners();
       if (presenceRef && currentUser) {
         try { remove(presenceRef); } catch (e) {}
       }
@@ -173,19 +450,44 @@ async function handleLogin(e) {
   clearError();
   const username = $("login-username").value.trim();
   const password = $("login-password").value;
+  if (!username) {
+    showError("Enter your username");
+    return;
+  }
 
+  let user = null;
   try {
-    const cred = await signInWithEmailAndPassword(auth, usernameToEmail(username), password);
-    localStorage.setItem("vibechat-username", username);
-    // Backfill profile if signup's DB write previously failed
     try {
-      const snap = await get(ref(db, `users/${cred.user.uid}`));
-      if (!snap.exists()) {
-        await set(ref(db, `users/${cred.user.uid}`), {
-          username: username,
-          createdAt: serverTimestamp()
-        });
-      }
+      // Usual path: typed name maps directly to the login email
+      // (original signup name, or pre-rename account).
+      user = (await signInWithEmailAndPassword(auth, usernameToEmail(username), password)).user;
+      localStorage.setItem("vibechat-username", username);
+    } catch (legacyErr) {
+      if (!["auth/invalid-credential", "auth/invalid-login-credentials", "auth/user-not-found", "auth/wrong-password"].includes(legacyErr.code)) throw legacyErr;
+      // Maybe a renamed display name — resolve via the username index.
+      const key = normalizeName(username);
+      if (!key) throw legacyErr;
+      const idxSnap = await get(ref(db, `usernames/${key}`));
+      const hit = idxSnap.val();
+      const uid = typeof hit === "string" ? hit : hit?.uid;
+      const profSnap = uid ? await get(ref(db, `users/${uid}`)) : null;
+      const login = profSnap?.val()?.login;
+      if (!uid || !login) throw legacyErr;
+      user = (await signInWithEmailAndPassword(auth, `${login}@vibechat.app`, password)).user;
+      localStorage.setItem("vibechat-username", profSnap.val()?.username || username);
+    }
+    // Backfill profile + index if signup's DB writes previously failed
+    try {
+      const profRef = ref(db, `users/${user.uid}`);
+      const snap = await get(profRef);
+      const cur = snap.val() || {};
+      const storedName = cur.username || localStorage.getItem("vibechat-username") || username;
+      await update(profRef, {
+        username: storedName,
+        login: cur.login || normalizeName(username),
+        ...(cur.createdAt ? {} : { createdAt: serverTimestamp() })
+      });
+      await ensureUsernameIndex(normalizeName(storedName), user.uid);
     } catch (dbErr) {
       console.error("Profile backfill failed:", dbErr);
     }
@@ -207,15 +509,32 @@ async function handleSignup(e) {
     return;
   }
 
+  if (username.length < 3 || username.length > 20) {
+    showError("Username must be 3–20 characters");
+    return;
+  }
+  const key = normalizeName(username);
+  if (!key) {
+    showError("Username needs at least one letter or number");
+    return;
+  }
+
   try {
+    const taken = await get(ref(db, `usernames/${key}`));
+    if (taken.exists()) {
+      showError("That username is taken");
+      return;
+    }
     const cred = await createUserWithEmailAndPassword(auth, usernameToEmail(username), password);
     localStorage.setItem("vibechat-username", username);
     // Store username in DB — don't block signup if this fails
     try {
       await set(ref(db, `users/${cred.user.uid}`), {
         username: username,
+        login: key,
         createdAt: serverTimestamp()
       });
+      await set(ref(db, `usernames/${key}`), cred.user.uid);
     } catch (dbErr) {
       console.error("Profile save failed:", dbErr);
       showError(`Account created but profile save failed (${dbErr.code || dbErr.message}). Check database rules/URL.`);
@@ -255,8 +574,10 @@ async function loadUserProfile() {
         try {
           await set(ref(db, `users/${currentUser.uid}`), {
             username: username,
+            login: normalizeName(username),
             createdAt: serverTimestamp()
           });
+          await ensureUsernameIndex(normalizeName(username), currentUser.uid);
           localStorage.setItem("vibechat-username", username);
         } catch (err) {
           console.error("Profile repair failed:", err);
@@ -302,6 +623,8 @@ async function loadUserProfile() {
     }
   }
   await refreshAdminList();
+  await refreshUserCache();
+  paintHeaderAvatar();
 
   // Live ban enforcement — get kicked even mid-session
   const myBanRef = ref(db, `banned/${currentUser.uid}`);
@@ -316,8 +639,12 @@ async function loadUserProfile() {
   // Show admin button if admin
   $("admin-btn").classList.toggle("hidden", !isAdmin);
 
+  await migrateAnnouncements();
   showScreen("lobby");
   loadRooms();
+  updateAnnouncementsBadge();
+  startNotifListeners();
+  if (notifEnabled()) registerPushToken();
 }
 
 $("logout-btn").addEventListener("click", async () => {
@@ -347,12 +674,36 @@ function loadRooms() {
   onChildRemoved(roomsRef, removedCb);
   roomListeners.push({ ref: roomsRef, event: "child_added", cb: addedCb });
   roomListeners.push({ ref: roomsRef, event: "child_removed", cb: removedCb });
+
+  // Unread mention counts for the lobby badges
+  const mentionsRef = ref(db, `mentions/${currentUser.uid}`);
+  const mentionsCb = (snap) => {
+    const data = snap.val() || {};
+    mentionCounts = {};
+    for (const [roomId, msgs] of Object.entries(data)) {
+      mentionCounts[roomId] = Object.keys(msgs || {}).length;
+    }
+    updateMentionBadges();
+  };
+  onValue(mentionsRef, mentionsCb);
+  roomListeners.push({ ref: mentionsRef, event: "value", cb: mentionsCb });
+}
+
+function updateMentionBadges() {
+  document.querySelectorAll("#room-list .room-card").forEach(card => {
+    const count = mentionCounts[card.dataset.roomId] || 0;
+    const badge = card.querySelector(".mention-badge");
+    if (!badge) return;
+    badge.textContent = count > 0 ? `🔔 ${count}` : "";
+    badge.classList.toggle("hidden", count === 0);
+  });
 }
 
 function addRoomToList(roomId, data) {
   const list = $("room-list");
   const empty = list.querySelector(".empty-state");
   if (empty) empty.remove();
+  if (list.querySelector(`[data-room-id="${roomId}"]`)) return;
 
   const card = document.createElement("div");
   card.className = "room-card";
@@ -362,15 +713,21 @@ function addRoomToList(roomId, data) {
       <h4>${escapeHtml(data.name)}</h4>
       <p>${data.isPrivate ? "🔒 Private" : "🌍 Public"} · ${data.memberCount || 0} members</p>
     </div>
-    <span class="room-card-badge ${data.isPrivate ? "private" : ""}">${data.isPrivate ? "🔒" : "🌍"}</span>
+    <div class="room-badges">
+      <span class="mention-badge hidden"></span>
+      <span class="room-card-badge ${data.isPrivate ? "private" : ""}">${data.isPrivate ? "🔒" : "🌍"}</span>
+    </div>
   `;
   card.addEventListener("click", () => handleJoinRoom(roomId, data));
+  roomCache[roomId] = data;
   list.appendChild(card);
+  updateMentionBadges();
 }
 
 function removeRoomFromList(roomId) {
   const card = document.querySelector(`[data-room-id="${roomId}"]`);
   if (card) card.remove();
+  delete roomCache[roomId];
   const list = $("room-list");
   if (list && !list.children.length) {
     list.innerHTML = '<p class="empty-state">No rooms yet — create one!</p>';
@@ -381,7 +738,7 @@ function handleJoinRoom(roomId, data) {
   if (data.isPrivate) {
     showPasswordModal(roomId, data);
   } else {
-    joinRoom(roomId, data);
+    joinRoom(roomId, data).catch(err => console.error("Join failed:", err));
   }
 }
 
@@ -400,7 +757,7 @@ function showPasswordModal(roomId, data) {
     const hashed = await simpleHash(pw);
     if (hashed === data.passwordHash) {
       overlay.classList.add("hidden");
-      joinRoom(roomId, data);
+      joinRoom(roomId, data).catch(err => console.error("Join failed:", err));
     } else {
       showToast("Wrong room password", "error");
     }
@@ -419,8 +776,10 @@ async function simpleHash(str) {
   return hash.toString(36);
 }
 
-function joinRoom(roomId, data) {
+async function joinRoom(roomId, data) {
   detachActiveListeners();
+  currentPresence = {};
+  hideMentionMenu();
   currentRoomId = roomId;
   currentRoom = data;
   $("chat-room-name").textContent = data.name;
@@ -428,6 +787,9 @@ function joinRoom(roomId, data) {
   const canClose = currentUser.uid === data.createdBy || isAdmin;
   $("close-room-btn").classList.toggle("hidden", !canClose);
   showScreen("chat");
+  await refreshUserCache();
+  // Opening the room marks its mentions as read
+  remove(ref(db, `mentions/${currentUser.uid}/${roomId}`)).catch(() => {});
   watchRoomExists(roomId);
   setupPresence(roomId);
   loadMessages(roomId);
@@ -449,6 +811,8 @@ function watchRoomExists(roomId) {
 
 function leaveRoom() {
   detachActiveListeners();
+  currentPresence = {};
+  hideMentionMenu();
   if (presenceRef) {
     remove(presenceRef);
     presenceRef = null;
@@ -462,6 +826,7 @@ function leaveRoom() {
   $("messages").innerHTML = "";
   showScreen("lobby");
   loadRooms();
+  updateAnnouncementsBadge();
 }
 
 function setupPresence(roomId) {
@@ -485,16 +850,18 @@ function setupPresence(roomId) {
   const presenceListRef = ref(db, `rooms/${roomId}/presence`);
   const presenceCb = (snap) => {
     const users = snap.val() || {};
+    currentPresence = users;
     const list = $("online-list");
     list.innerHTML = "";
     const count = Object.keys(users).length;
     $("online-count").textContent = count;
 
-    Object.values(users).forEach(u => {
+    Object.entries(users).forEach(([uid, u]) => {
       const li = document.createElement("li");
-      li.innerHTML = `<span class="online-dot"></span> ${escapeHtml(u.username)}`;
+      li.innerHTML = `<span class="online-dot"></span><span class="avatar" data-uid="${escapeHtml(uid)}" data-name="${escapeHtml(u.username)}">${avatarInner(u.username, (userCache[uid] || {}).photoURL)}</span> ${escapeHtml(u.username)}`;
       list.appendChild(li);
     });
+    if (mentionMenuState.open) updateMentionMenu();
   };
   onValue(presenceListRef, presenceCb);
   trackListener(presenceListRef, "value", presenceCb);
@@ -543,12 +910,14 @@ function appendMessage(msgId, msg) {
 
   div.innerHTML = `
     <div class="message-header">
+      <span class="avatar" data-uid="${escapeHtml(msg.uid)}" data-name="${escapeHtml(msg.username)}">${avatarInner(msg.username, (userCache[msg.uid] || {}).photoURL)}</span>
       <span class="message-username">${escapeHtml(msg.username)}</span>
       ${isMsgAdmin ? '<span class="message-admin-badge">ADMIN</span>' : isMsgOwner ? '<span class="message-admin-badge">OWNER</span>' : ""}
       <span class="message-time">${formatTime(msg.timestamp)}</span>
     </div>
-    <div class="message-bubble">${linkify(msg.text || "")}${msg.imageUrl ? `<a href="${escapeHtml(msg.imageUrl)}" target="_blank" rel="noopener"><img src="${escapeHtml(msg.imageUrl)}" class="message-image" loading="lazy" alt="shared image" /></a>` : ""}${msg.fileUrl ? `<a href="${escapeHtml(msg.fileUrl)}" target="_blank" rel="noopener" download="${escapeHtml(msg.fileName || "file")}" class="file-link">📎 ${escapeHtml(msg.fileName || "Download file")}</a>` : ""}</div>
+    <div class="message-bubble">${renderMessageText(msg.text, isOwnerName(msg.username))}${msg.imageUrl ? `<a href="${escapeHtml(msg.imageUrl)}" target="_blank" rel="noopener"><img src="${escapeHtml(msg.imageUrl)}" class="message-image" loading="lazy" alt="shared image" /></a>` : ""}${msg.fileUrl ? `<a href="${escapeHtml(msg.fileUrl)}" target="_blank" rel="noopener" download="${escapeHtml(msg.fileName || "file")}" class="file-link">📎 ${escapeHtml(msg.fileName || "Download file")}</a>` : ""}</div>
   `;
+  if (messageMentionsMe(msg)) div.classList.add("mentioned");
   container.appendChild(div);
   if (isAdmin) {
     const header = div.querySelector(".message-header");
@@ -614,74 +983,46 @@ function initChat() {
     if (!text || !currentRoomId) return;
 
     const messagesRef = ref(db, `rooms/${currentRoomId}/messages`);
-    await push(messagesRef, {
+    const msgRef = await push(messagesRef, {
       uid: currentUser.uid,
       username: getUsername(),
       text: text,
       timestamp: serverTimestamp()
     });
+    // Notify mentioned users (unread badge on their lobby room card)
+    try {
+      for (const uid of extractMentionedUids(text, isOwner)) {
+        await set(ref(db, `mentions/${uid}/${currentRoomId}/${msgRef.key}`), {
+          by: getUsername(),
+          text: text.slice(0, 120),
+          at: serverTimestamp()
+        });
+      }
+    } catch (err) {
+      console.error("Mention notify failed:", err);
+    }
 
     input.value = "";
     if (typingRef) remove(typingRef);
+    hideMentionMenu();
   });
 
-  // File/image attachments via Firebase Storage
-  $("attach-btn").addEventListener("click", () => $("file-input").click());
-  $("file-input").addEventListener("change", async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
-    if (!file || !currentRoomId) return;
-    if (isBanned) {
-      showToast("You are banned", "error");
-      return;
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      showToast("File must be under 5MB", "error");
-      return;
-    }
-
-    const sendBtn = $("send-btn");
-    const attachBtn = $("attach-btn");
-    sendBtn.disabled = true;
-    attachBtn.disabled = true;
-    try {
-      const safeName = file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
-      const sRef = storageRef(storage, `chat-files/${currentRoomId}/${Date.now()}_${safeName}`);
-      const task = uploadBytesResumable(sRef, file);
-      await new Promise((resolve, reject) => {
-        task.on("state_changed",
-          (snap) => {
-            const pct = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
-            sendBtn.textContent = `${pct}%`;
-          },
-          reject,
-          resolve
-        );
-      });
-      const url = await getDownloadURL(task.snapshot.ref);
-      const isImage = file.type.startsWith("image/");
-      const caption = $("message-input").value.trim();
-      await push(ref(db, `rooms/${currentRoomId}/messages`), {
-        uid: currentUser.uid,
-        username: getUsername(),
-        text: caption || (isImage ? "📷 Image" : `📎 ${file.name}`),
-        ...(isImage ? { imageUrl: url } : { fileUrl: url, fileName: file.name }),
-        timestamp: serverTimestamp()
-      });
-      $("message-input").value = "";
-      if (typingRef) remove(typingRef);
-    } catch (err) {
-      console.error("Upload failed:", err);
-      showToast(`Upload failed (${err.code || err.message})`, "error");
-    } finally {
-      sendBtn.disabled = false;
-      sendBtn.textContent = "Send";
-      attachBtn.disabled = false;
-    }
+  // Mention autocomplete (@ to ping someone)
+  $("message-input").addEventListener("input", updateMentionMenu);
+  $("message-input").addEventListener("keydown", mentionMenuKey);
+  $("mention-btn").addEventListener("click", () => {
+    const input = $("message-input");
+    if (!currentRoomId) return;
+    input.focus();
+    const pos = input.selectionStart ?? input.value.length;
+    const before = input.value.slice(0, pos);
+    const after = input.value.slice(pos);
+    const needsSpace = before && !/\s$/.test(before) ? " " : "";
+    input.value = before + needsSpace + "@" + after;
+    const newPos = before.length + needsSpace.length + 1;
+    input.setSelectionRange(newPos, newPos);
+    updateMentionMenu();
   });
-
-  // GIF picker (Tenor)
-  $("gif-btn").addEventListener("click", toggleGifPicker);
 }
 
 function showConfirmModal(title, bodyHtml, confirmText, onConfirm) {
@@ -698,93 +1039,167 @@ function showConfirmModal(title, bodyHtml, confirmText, onConfirm) {
   overlay.classList.remove("hidden");
 }
 
-// ============ GIF PICKER (TENOR) ============
-function toggleGifPicker() {
-  let picker = document.querySelector(".gif-picker");
-  if (picker) {
-    picker.classList.toggle("hidden");
-    return;
-  }
+// ============ PROFILE PICTURE ============
+let pendingAvatar = null;
 
-  picker = document.createElement("div");
-  picker.className = "gif-picker";
-  picker.innerHTML = `
-    <div class="gif-search-row">
-      <input type="text" id="gif-search" placeholder="Search GIFs..." autocomplete="off" />
+function openProfileModal() {
+  const overlay = $("modal-overlay");
+  const currentPhoto = (userCache[currentUser.uid] || {}).photoURL || null;
+  pendingAvatar = null;
+  $("modal-title").textContent = "Your Profile";
+  $("modal-body").innerHTML = `
+    <div class="profile-preview"><span id="profile-preview-avatar" class="avatar avatar-lg">${avatarInner(getUsername(), currentPhoto)}</span></div>
+    <p style="margin-bottom:12px;color:var(--text-secondary);text-align:center">${escapeHtml(getUsername())}</p>
+    <input type="file" id="profile-file" accept="image/*" style="width:100%;margin-bottom:12px" />
+    <button id="profile-remove" class="btn btn-ghost btn-small" ${currentPhoto ? "" : "disabled"}>Remove picture</button>
+    <div class="profile-section">
+      <h4>Change username</h4>
+      <input type="text" id="profile-username" maxlength="20" placeholder="New username" autocomplete="off" />
+      <button id="profile-username-save" class="btn btn-primary btn-small">Change Username</button>
     </div>
-    <div class="gif-grid"></div>
-    <div class="gif-attrib">Powered by Tenor</div>
+    <div class="profile-section">
+      <h4>Change password</h4>
+      <input type="password" id="profile-pw-current" placeholder="Current password" autocomplete="current-password" />
+      <input type="password" id="profile-pw-new" placeholder="New password (min 6)" autocomplete="new-password" />
+      <input type="password" id="profile-pw-confirm" placeholder="Confirm new password" autocomplete="new-password" />
+      <button id="profile-pw-save" class="btn btn-primary btn-small">Change Password</button>
+    </div>
   `;
-  document.querySelector(".chat-main").appendChild(picker);
+  const confirmBtn = $("modal-confirm");
+  confirmBtn.textContent = "Save";
+  confirmBtn.onclick = saveProfileAvatar;
+  $("modal-cancel").onclick = () => overlay.classList.add("hidden");
+  overlay.classList.remove("hidden");
 
-  const grid = picker.querySelector(".gif-grid");
-  const search = picker.querySelector("#gif-search");
-  let debounce;
-  search.addEventListener("input", () => {
-    clearTimeout(debounce);
-    debounce = setTimeout(() => loadGifs(grid, search.value.trim()), 400);
-  });
-  search.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      clearTimeout(debounce);
-      loadGifs(grid, search.value.trim());
-    }
-  });
-  loadGifs(grid, "");
-}
-
-async function loadGifs(grid, q) {
-  if (!TENOR_API_KEY || TENOR_API_KEY === "YOUR_TENOR_KEY") {
-    grid.innerHTML = '<p class="gif-status">GIFs need a Tenor API key — ask the owner to add one.</p>';
-    return;
-  }
-  grid.innerHTML = '<p class="gif-status">Loading…</p>';
-  try {
-    const endpoint = q
-      ? `https://tenor.googleapis.com/v2/search?q=${encodeURIComponent(q)}&key=${TENOR_API_KEY}&limit=20&media_filter=tinygif,gif`
-      : `https://tenor.googleapis.com/v2/featured?key=${TENOR_API_KEY}&limit=12&media_filter=tinygif,gif`;
-    const res = await fetch(endpoint);
-    if (!res.ok) throw new Error(`Tenor ${res.status}`);
-    const data = await res.json();
-    grid.innerHTML = "";
-    if (!data.results?.length) {
-      grid.innerHTML = '<p class="gif-status">No GIFs found.</p>';
+  $("profile-file").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      showToast("Image must be under 5MB", "error");
       return;
     }
-    data.results.forEach(r => {
-      const tiny = r.media_formats?.tinygif?.url;
-      const full = r.media_formats?.gif?.url || tiny;
-      if (!tiny) return;
-      const img = document.createElement("img");
-      img.src = tiny;
-      img.loading = "lazy";
-      img.alt = r.content_description || "GIF";
-      img.addEventListener("click", () => sendGif(full));
-      grid.appendChild(img);
-    });
+    try {
+      pendingAvatar = await processAvatar(file);
+      $("profile-preview-avatar").innerHTML = avatarInner(getUsername(), pendingAvatar);
+    } catch (err) {
+      console.error("Avatar processing failed:", err);
+      showToast("Could not read that image", "error");
+    }
+  });
+
+  $("profile-remove").addEventListener("click", async () => {
+    try {
+      await update(ref(db, `users/${currentUser.uid}`), { photoURL: null });
+      if (userCache[currentUser.uid]) userCache[currentUser.uid].photoURL = null;
+      overlay.classList.add("hidden");
+      paintHeaderAvatar();
+      paintAvatars(currentUser.uid);
+      showToast("Profile picture removed");
+    } catch (err) {
+      console.error("Avatar remove failed:", err);
+      showToast(`Could not remove picture (${err.code || err.message})`, "error");
+    }
+  });
+
+  $("profile-username-save").addEventListener("click", changeUsername);
+  $("profile-pw-save").addEventListener("click", changePassword);
+}
+
+async function saveProfileAvatar() {
+  if (!pendingAvatar) {
+    $("modal-overlay").classList.add("hidden");
+    return;
+  }
+  try {
+    await update(ref(db, `users/${currentUser.uid}`), { photoURL: pendingAvatar });
+    if (!userCache[currentUser.uid]) userCache[currentUser.uid] = {};
+    userCache[currentUser.uid].photoURL = pendingAvatar;
+    userCache[currentUser.uid].username = getUsername();
+    $("modal-overlay").classList.add("hidden");
+    paintHeaderAvatar();
+    paintAvatars(currentUser.uid);
+    showToast("Profile picture updated");
   } catch (err) {
-    console.error("GIF load failed:", err);
-    grid.innerHTML = '<p class="gif-status">Could not load GIFs. Try again.</p>';
+    console.error("Avatar save failed:", err);
+    showToast(`Could not save picture (${err.code || err.message})`, "error");
   }
 }
 
-async function sendGif(url) {
-  if (!currentRoomId || isBanned || !currentUser) return;
-  const picker = document.querySelector(".gif-picker");
-  if (picker) picker.classList.add("hidden");
-  try {
-    await push(ref(db, `rooms/${currentRoomId}/messages`), {
-      uid: currentUser.uid,
-      username: getUsername(),
-      text: "🎬 GIF",
-      imageUrl: url,
-      timestamp: serverTimestamp()
-    });
-  } catch (err) {
-    console.error("GIF send failed:", err);
-    showToast("Could not send GIF", "error");
+async function changeUsername() {
+  const newName = $("profile-username").value.trim();
+  if (!newName) return;
+  if (newName === getUsername()) {
+    showToast("That's already your username", "error");
+    return;
   }
+  if (newName.length < 3 || newName.length > 20) {
+    showToast("Username must be 3–20 characters", "error");
+    return;
+  }
+  const newKey = normalizeName(newName);
+  if (!newKey) {
+    showToast("Username needs at least one letter or number", "error");
+    return;
+  }
+  const oldKey = normalizeName(getUsername());
+  try {
+    if (newKey !== oldKey) {
+      const taken = await get(ref(db, `usernames/${newKey}`));
+      const hit = taken.val();
+      const owner = typeof hit === "string" ? hit : hit?.uid;
+      if (taken.exists() && owner !== currentUser.uid) {
+        showToast("That username is taken", "error");
+        return;
+      }
+      await set(ref(db, `usernames/${newKey}`), currentUser.uid);
+      await remove(ref(db, `usernames/${oldKey}`));
+    }
+    await update(ref(db, `users/${currentUser.uid}`), { username: newName });
+  } catch (err) {
+    console.error("Username change failed:", err);
+    showToast(`Could not change username (${err.code || err.message})`, "error");
+    return;
+  }
+  localStorage.setItem("vibechat-username", newName);
+  if (userCache[currentUser.uid]) userCache[currentUser.uid].username = newName;
+  $("current-username").textContent = newName;
+  isOwner = isOwnerName(newName);
+  if (isOwner) isAdmin = true;
+  $("admin-btn").classList.toggle("hidden", !isAdmin);
+  paintHeaderAvatar();
+  paintAvatars(currentUser.uid);
+  $("modal-overlay").classList.add("hidden");
+  showToast(`Username changed to ${newName} — you can log in with either name`);
+}
+
+async function changePassword() {
+  const currentPw = $("profile-pw-current").value;
+  const next = $("profile-pw-new").value;
+  const confirm = $("profile-pw-confirm").value;
+  if (!currentPw || !next || !confirm) {
+    showToast("Fill in all password fields", "error");
+    return;
+  }
+  if (next !== confirm) {
+    showToast("New passwords don't match", "error");
+    return;
+  }
+  if (next.length < 6) {
+    showToast("New password must be at least 6 characters", "error");
+    return;
+  }
+  try {
+    await reauthenticateWithCredential(currentUser, EmailAuthProvider.credential(currentUser.email, currentPw));
+    await updatePassword(currentUser, next);
+  } catch (err) {
+    console.error("Password change failed:", err);
+    showToast(
+      err.code === "auth/wrong-password" || err.code === "auth/invalid-credential" ? "Current password is wrong"
+      : `Could not change password (${err.code || err.message})`, "error");
+    return;
+  }
+  $("modal-overlay").classList.add("hidden");
+  showToast("Password changed");
 }
 
 // ============ CREATE ROOM ============
@@ -887,6 +1302,12 @@ async function loadAdminData() {
     info.className = "admin-item-info";
     const badges = `${userIsOwner ? '<span class="message-admin-badge">OWNER</span>' : userIsAdmin ? '<span class="message-admin-badge">ADMIN</span>' : ""} ${userIsBanned ? '<span class="message-admin-badge">BANNED</span>' : ""}`;
     info.innerHTML = `<h5>${escapeHtml(data.username)} ${badges}</h5><p>UID: ${escapeHtml(id.slice(0, 12))}...</p>`;
+    const av = document.createElement("span");
+    av.className = "avatar";
+    av.dataset.uid = id;
+    av.dataset.name = data.username;
+    av.innerHTML = avatarInner(data.username, data.photoURL);
+    item.appendChild(av);
     item.appendChild(info);
 
     const actions = document.createElement("div");
@@ -1000,9 +1421,368 @@ window.__deleteMessage = async (roomId, msgId) => {
   loadAdminData();
 };
 
+// ============ COLOUR THEMES ============
+const THEMES = [
+  { id: "purple", name: "Midnight Purple", color: "#7c6cf0" },
+  { id: "ocean", name: "Ocean Blue", color: "#3aa8e0" },
+  { id: "mint", name: "Mint Green", color: "#3ecf8e" },
+  { id: "sunset", name: "Sunset Orange", color: "#f07830" },
+  { id: "rose", name: "Rose Pink", color: "#ec5f8c" },
+  { id: "retro", name: "Retro Terminal", color: "#00ff41" },
+  { id: "daylight", name: "Daylight", color: "#f2f2f7" }
+];
+
+function currentTheme() {
+  return localStorage.getItem("vibechat-theme") || "purple";
+}
+
+function applyTheme(id) {
+  if (!THEMES.some(t => t.id === id)) id = "purple";
+  if (id === "purple") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", id);
+  localStorage.setItem("vibechat-theme", id);
+  document.querySelectorAll(".theme-row").forEach(row => {
+    const check = row.querySelector(".theme-check");
+    if (check) check.textContent = row.dataset.theme === id ? "✓" : "";
+  });
+}
+
+function initThemes() {
+  const panel = $("theme-panel");
+  panel.innerHTML = "<h4>Colour theme</h4>";
+  THEMES.forEach(t => {
+    const row = document.createElement("button");
+    row.className = "theme-row";
+    row.dataset.theme = t.id;
+    row.innerHTML = `<span class="theme-dot" style="background:${t.color}"></span> ${t.name} <span class="theme-check"></span>`;
+    row.addEventListener("click", () => {
+      applyTheme(t.id);
+      panel.classList.add("hidden");
+    });
+    panel.appendChild(row);
+  });
+  applyTheme(currentTheme());
+  $("theme-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    panel.classList.toggle("hidden");
+  });
+  document.addEventListener("click", (e) => {
+    if (!panel.classList.contains("hidden") && !e.target.closest(".theme-wrap")) {
+      panel.classList.add("hidden");
+    }
+  });
+}
+// ============ ANNOUNCEMENTS TAB ============
+let annListeners = [];
+
+function closeAnnListeners() {
+  annListeners.forEach(({ ref: r, event, cb }) => { try { off(r, event, cb); } catch (e) {} });
+  annListeners = [];
+}
+
+function openAnnouncements() {
+  closeAnnListeners();
+  $("ann-messages").innerHTML = "";
+  $("ann-form").classList.toggle("hidden", !isOwner);
+  $("ann-readonly").classList.toggle("hidden", isOwner);
+  localStorage.setItem("vibechat-ann-seen", String(Date.now()));
+  $("ann-dot").classList.add("hidden");
+  remove(ref(db, `mentions/${currentUser.uid}/announcements`)).catch(() => {});
+  showScreen("announcements");
+  const msgsRef = query(ref(db, "announcements/messages"), orderByChild("timestamp"), limitToLast(100));
+  const addedCb = (snap) => appendAnnouncement(snap.key, snap.val());
+  const removedCb = (snap) => {
+    document.querySelector(`#ann-messages .message[data-msg-id="${snap.key}"]`)?.remove();
+  };
+  onChildAdded(msgsRef, addedCb);
+  onChildRemoved(msgsRef, removedCb);
+  annListeners.push({ ref: msgsRef, event: "child_added", cb: addedCb });
+  annListeners.push({ ref: msgsRef, event: "child_removed", cb: removedCb });
+}
+
+function closeAnnouncements() {
+  closeAnnListeners();
+  $("ann-messages").innerHTML = "";
+  showScreen("lobby");
+}
+
+function appendAnnouncement(msgId, msg) {
+  const container = $("ann-messages");
+  if (!msg || container.querySelector(`[data-msg-id="${msgId}"]`)) return;
+  const div = document.createElement("div");
+  div.className = "message other";
+  div.dataset.msgId = msgId;
+  const isMsgAdmin = adminUids.has(msg.uid);
+  const isMsgOwner = !isMsgAdmin && isOwnerName(msg.username);
+  div.innerHTML = `
+    <div class="message-header">
+      <span class="avatar" data-uid="${escapeHtml(msg.uid)}" data-name="${escapeHtml(msg.username)}">${avatarInner(msg.username, (userCache[msg.uid] || {}).photoURL)}</span>
+      <span class="message-username">${escapeHtml(msg.username)}</span>
+      ${isMsgAdmin ? '<span class="message-admin-badge">ADMIN</span>' : isMsgOwner ? '<span class="message-admin-badge">OWNER</span>' : ""}
+      <span class="message-time">${formatTime(msg.timestamp)}</span>
+    </div>
+    <div class="message-bubble">${renderMessageText(msg.text, isOwnerName(msg.username))}</div>
+  `;
+  if (messageMentionsMe(msg)) div.classList.add("mentioned");
+  if (isAdmin) {
+    const header = div.querySelector(".message-header");
+    const del = document.createElement("button");
+    del.className = "msg-delete";
+    del.title = "Delete announcement";
+    del.textContent = "🗑️";
+    del.addEventListener("click", () => {
+      showConfirmModal(
+        "Delete this announcement?",
+        `<p style="color:var(--text-secondary)">${escapeHtml((msg.text || "").slice(0, 120))}</p>`,
+        "Delete",
+        () => remove(ref(db, `announcements/messages/${msgId}`))
+      );
+    });
+    header.appendChild(del);
+  }
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+async function updateAnnouncementsBadge() {
+  try {
+    if (!currentUser) return;
+    const seen = Number(localStorage.getItem("vibechat-ann-seen") || 0);
+    const [msgSnap, menSnap] = await Promise.all([
+      get(query(ref(db, "announcements/messages"), orderByChild("timestamp"), limitToLast(1))),
+      get(ref(db, `mentions/${currentUser.uid}/announcements`))
+    ]);
+    let latest = 0;
+    msgSnap.forEach(s => {
+      latest = Math.max(latest, s.val()?.timestamp || 0);
+    });
+    const hasMentions = menSnap.exists() && Object.keys(menSnap.val() || {}).length > 0;
+    $("ann-dot").classList.toggle("hidden", !(latest > seen || hasMentions));
+  } catch (err) {
+    /* offline or no announcements yet — no badge */
+  }
+}
+
+function initAnnouncements() {
+  $("ann-btn").addEventListener("click", openAnnouncements);
+  $("ann-back-btn").addEventListener("click", closeAnnouncements);
+  $("ann-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!isOwner || isBanned) return;
+    const input = $("ann-input");
+    const text = input.value.trim();
+    if (!text) return;
+    const annRef = await push(ref(db, "announcements/messages"), {
+      uid: currentUser.uid,
+      username: getUsername(),
+      text: text,
+      timestamp: serverTimestamp()
+    });
+    // Owner @everyone pings light up everyone's Announcements tab
+    try {
+      await Promise.all(extractMentionedUids(text, isOwner).map(uid =>
+        set(ref(db, `mentions/${uid}/announcements/${annRef.key}`), {
+          by: getUsername(),
+          text: text.slice(0, 120),
+          at: serverTimestamp()
+        })
+      ));
+    } catch (err) {
+      console.error("Announcement mention notify failed:", err);
+    }
+    input.value = "";
+  });
+}
+
+// ============ BROWSER NOTIFICATIONS ============
+// Foreground only (true background push needs a server). Fires for
+// mentions and announcements while the app is open, even in another tab.
+let notifListeners = [];
+let notifStarted = false;
+let notifiedKeys = new Set();
+let roomCache = {};
+
+function notifSupported() {
+  return "Notification" in window;
+}
+
+function notifEnabled() {
+  return notifSupported() && Notification.permission === "granted" &&
+    localStorage.getItem("vibechat-notif-enabled") === "1";
+}
+
+function paintBell() {
+  const bell = $("notif-bell");
+  if (!bell) return;
+  const on = notifEnabled();
+  bell.textContent = on ? "🔔" : "🔕";
+  bell.title = !notifSupported() ? "Notifications not supported in this browser"
+    : Notification.permission === "denied" ? "Notifications blocked — allow them in browser site settings"
+    : on ? "Notifications on (click to mute)" : "Notifications off (click to enable)";
+}
+
+function pushNotify(title, body, onClick) {
+  if (!notifEnabled()) return;
+  try {
+    const n = new Notification(title, { body: body || "" });
+    n.onclick = () => {
+      window.focus();
+      try { if (onClick) onClick(); } catch (e) {}
+      n.close();
+    };
+  } catch (err) {
+    console.error("Notify failed:", err);
+  }
+}
+
+async function enableNotifications() {
+  if (!notifSupported()) {
+    showToast("This browser doesn't support notifications", "error");
+    return;
+  }
+  if (Notification.permission === "denied") {
+    showToast("Notifications are blocked — allow them in browser site settings", "error");
+    return;
+  }
+  if (Notification.permission === "default") {
+    const res = await Notification.requestPermission();
+    localStorage.setItem("vibechat-notif-asked", "1");
+    $("notif-banner").classList.add("hidden");
+    if (res !== "granted") return;
+  }
+  localStorage.setItem("vibechat-notif-enabled", "1");
+  paintBell();
+  showToast("Notifications on");
+  registerPushToken();
+}
+
+function toggleNotifications() {
+  if (!notifSupported()) {
+    showToast("This browser doesn't support notifications", "error");
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    enableNotifications();
+    return;
+  }
+  const on = notifEnabled();
+  localStorage.setItem("vibechat-notif-enabled", on ? "0" : "1");
+  paintBell();
+  if (!on) {
+    showToast("Notifications on");
+    registerPushToken();
+  } else {
+    showToast("Notifications muted");
+    if (currentUser) update(ref(db, `users/${currentUser.uid}`), { notifyEnabled: false }).catch(() => {});
+  }
+}
+
+function handleMentionEvent(roomId, msgs) {
+  const keys = Object.keys(msgs || {});
+  const fresh = keys.filter(k => !notifiedKeys.has(`${roomId}/${k}`));
+  fresh.forEach(k => notifiedKeys.add(`${roomId}/${k}`));
+  if (!fresh.length) return;
+  const latestKey = fresh.sort().pop();
+  const m = msgs[latestKey];
+  if (!m) return;
+  const viewingChat = screens.chat.classList.contains("active") && currentRoomId === roomId;
+  const viewingAnn = screens.announcements.classList.contains("active") && roomId === "announcements";
+  if (viewingChat || viewingAnn) return;
+  if (roomId === "announcements") {
+    pushNotify("📢 Announcement", `${m.by}: ${m.text || ""}`, () => openAnnouncements());
+  } else {
+    const roomName = (roomCache[roomId] || {}).name || "a room";
+    pushNotify("🔔 You were mentioned", `${m.by} in ${roomName}: ${m.text || ""}`, () => {
+      const data = roomCache[roomId];
+      if (data) handleJoinRoom(roomId, data);
+    });
+  }
+}
+
+async function startNotifListeners() {
+  if (notifStarted || !currentUser) return;
+  notifStarted = true;
+  notifiedKeys = new Set();
+  try {
+    const [menSnap, annSnap] = await Promise.all([
+      get(ref(db, `mentions/${currentUser.uid}`)),
+      get(query(ref(db, "announcements/messages"), orderByChild("timestamp"), limitToLast(30)))
+    ]);
+    const men = menSnap.val() || {};
+    for (const [roomId, msgs] of Object.entries(men)) {
+      Object.keys(msgs || {}).forEach(k => notifiedKeys.add(`${roomId}/${k}`));
+    }
+    Object.keys(annSnap.val() || {}).forEach(k => notifiedKeys.add(`ann/${k}`));
+  } catch (err) {
+    /* offline — listeners still attach below */
+  }
+  const menRef = ref(db, `mentions/${currentUser.uid}`);
+  const menAdded = (snap) => handleMentionEvent(snap.key, snap.val());
+  const menChanged = (snap) => handleMentionEvent(snap.key, snap.val());
+  onChildAdded(menRef, menAdded);
+  onChildChanged(menRef, menChanged);
+  notifListeners.push({ ref: menRef, event: "child_added", cb: menAdded });
+  notifListeners.push({ ref: menRef, event: "child_changed", cb: menChanged });
+  const annRef = query(ref(db, "announcements/messages"), orderByChild("timestamp"), limitToLast(30));
+  const annAdded = (snap) => {
+    if (notifiedKeys.has(`ann/${snap.key}`)) return;
+    notifiedKeys.add(`ann/${snap.key}`);
+    const msg = snap.val();
+    if (!msg || msg.uid === currentUser.uid) return;
+    if (screens.announcements.classList.contains("active")) return;
+    pushNotify("📢 New announcement", `${msg.username}: ${(msg.text || "").slice(0, 120)}`, () => openAnnouncements());
+  };
+  onChildAdded(annRef, annAdded);
+  notifListeners.push({ ref: annRef, event: "child_added", cb: annAdded });
+}
+
+function stopNotifListeners() {
+  notifListeners.forEach(({ ref: r, event, cb }) => { try { off(r, event, cb); } catch (e) {} });
+  notifListeners = [];
+  notifStarted = false;
+  notifiedKeys = new Set();
+}
+
+// Registers this device for closed-browser push (FCM token → RTDB).
+// Needs VAPID_KEY set in firebase-config.js. Safe to call repeatedly.
+async function registerPushToken() {
+  try {
+    if (!("serviceWorker" in navigator) || !("Notification" in window)) return;
+    if (!VAPID_KEY || VAPID_KEY === "YOUR_VAPID_KEY") return;
+    if (!currentUser || Notification.permission !== "granted") return;
+    const { getMessaging, getToken } = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging.js");
+    const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js");
+    const token = await getToken(getMessaging(), { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
+    if (!token) return;
+    const snap = await get(ref(db, `pushTokens/${currentUser.uid}`));
+    const exists = Object.values(snap.val() || {}).some(t => t.token === token);
+    if (!exists) {
+      await push(ref(db, `pushTokens/${currentUser.uid}`), { token, at: serverTimestamp() });
+    }
+    await update(ref(db, `users/${currentUser.uid}`), { notifyEnabled: true });
+  } catch (err) {
+    console.error("Push token registration failed:", err);
+  }
+}
+
+function initNotifications() {
+  $("notif-bell").addEventListener("click", toggleNotifications);
+  $("notif-enable").addEventListener("click", enableNotifications);
+  $("notif-dismiss").addEventListener("click", () => {
+    localStorage.setItem("vibechat-notif-asked", "1");
+    $("notif-banner").classList.add("hidden");
+  });
+  if (notifSupported() && Notification.permission === "default" && !localStorage.getItem("vibechat-notif-asked")) {
+    $("notif-banner").classList.remove("hidden");
+  }
+  paintBell();
+}
+
 // ============ NAVIGATION ============
 function initNavigation() {
   $("back-btn").addEventListener("click", leaveRoom);
+
+  $("profile-btn").addEventListener("click", openProfileModal);
 
   $("close-room-btn").addEventListener("click", () => {
     if (!currentRoomId) return;
@@ -1027,4 +1807,17 @@ document.addEventListener("DOMContentLoaded", () => {
   initCreateRoom();
   initAdmin();
   initNavigation();
+  initGamesUI();
+  initThemes();
+  initAnnouncements();
+  initNotifications();
 });
+
+function initGamesUI() {
+  initGames();
+  $("games-btn").addEventListener("click", () => showScreen("games"));
+  $("games-back-btn").addEventListener("click", () => {
+    closeGame();
+    showScreen("lobby");
+  });
+}

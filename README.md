@@ -17,10 +17,14 @@ A chill place to hang out and chat in real time.
 - 💬 Real-time messages with history
 - 🟢 See who's online in each room
 - ⌨️ Typing indicators
-- 📎 Share images and files (up to 5MB)
-- 🎬 GIFs powered by Tenor
+- 🖼️ Profile pictures, username & password changes
+- 📣 @mentions + owner-only @everyone, with unread badges
+- 🔔 Browser notifications for mentions & announcements
+- 📌 Announcements tab (owner posts, everyone reads)
+- 🎮 Minigames with leaderboards
 - 🗑️ Mods can delete messages right from chat
 - 🌙 Dark mode built in
+- 🎨 Colour themes (including light mode)
 - 👑 Room creators can close their own rooms
 - 🛡️ Moderation — admins can remove bad rooms and messages, the owner can ban users
 
