@@ -7,8 +7,12 @@ import {
   ref,
   get,
   set,
+  runTransaction,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+// Coins per score point, per game (scores live on very different scales)
+const COIN_RATES = { flappy: 2, snake: 2, breakout: 0.1, memory: 0.05, wave: 1 };
 
 let activeGame = null;
 
@@ -68,6 +72,10 @@ function makeApi(gameId) {
               at: serverTimestamp()
             });
           }
+          // Coins for playing (capped per game)
+          const earned = Math.max(1, Math.min(150, Math.round(score * (COIN_RATES[gameId] ?? 0.5))));
+          await runTransaction(ref(db, `users/${user.uid}/coins`), (c) => (c || 0) + earned);
+          window.dispatchEvent(new CustomEvent("vibechat-coins", { detail: earned }));
         }
       } catch (err) {
         console.error("Highscore save failed:", err);
@@ -758,10 +766,221 @@ function createMemory(stage, api) {
   };
 }
 
+// ============ GBA EMULATOR (EmulatorJS) ============
+// ROMs are user-supplied (upload or URL) — nothing copyrighted ships
+// with the app. No BIOS file needed (built-in replacement).
+// Uploads are staged in Cache Storage and served over same-origin https
+// by the app service worker, because the EmulatorJS loader refuses
+// blob: URLs.
+let gbaCachedUrl = null;
+
+function gbaEsc(str) {
+  const div = document.createElement("div");
+  div.textContent = str ?? "";
+  return div.innerHTML;
+}
+
+// Layered teardown: a new instance per ROM means the old one must die,
+// or you get double audio + 2x CPU (the classic "runs badly" symptom).
+function killEmu() {
+  try {
+    const emu = window.EJS_emulator;
+    if (emu) {
+      try { emu.pause?.(); } catch (e) { /* no pause API */ }
+      try { emu.callEvent?.("exit"); } catch (e) { /* no event API */ }
+    }
+  } catch (e) { /* already gone */ }
+  try { window.EJS_emulator = null; } catch (e) {}
+  document.querySelector('script[data-emu-loader]')?.remove();
+}
+
+async function gbaForgetCached() {
+  if (!gbaCachedUrl) return;
+  try {
+    const cache = await caches.open("vibechat-emu-roms");
+    await cache.delete(gbaCachedUrl);
+  } catch (e) { /* cache unavailable — nothing to clean */ }
+  gbaCachedUrl = null;
+}
+
+// The ROM worker must CONTROL this page for its fetches to be
+// intercepted, so register the app-wide worker (default scope) and wait
+// for control — not just activation.
+let emuDiagLine = "";
+async function ensureEmuSW(romUrl) {
+  const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js");
+  let worker = reg.installing || reg.waiting || reg.active;
+  try {
+    await reg.update();
+    worker = reg.installing || reg.waiting || reg.active || worker;
+  } catch (e) { /* offline-first update failed — proceed */ }
+  if (worker && worker.state !== "activated") {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("SW activation timeout")), 20000);
+      const onChange = () => {
+        if (worker.state === "activated") {
+          clearTimeout(timeout);
+          worker.removeEventListener("statechange", onChange);
+          resolve();
+        } else if (worker.state === "redundant") {
+          clearTimeout(timeout);
+          worker.removeEventListener("statechange", onChange);
+          reject(new Error("SW redundant"));
+        }
+      };
+      worker.addEventListener("statechange", onChange);
+    });
+  }
+  if (!navigator.serviceWorker.controller) {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("SW controller timeout")), 15000);
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
+    });
+  }
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    emuDiagLine = regs.map(r => `${r.scope} [${r.active?.state || r.installing?.state || r.waiting?.state || "?"}]`).join(" | ") || "none";
+    const covered = regs.some(r => r.active && romUrl.startsWith(r.scope));
+    if (!covered) throw new Error("SW scope mismatch");
+  } catch (err) {
+    if (err.message === "SW scope mismatch") throw err;
+    /* getRegistrations failed — proceed, probe will tell us */
+  }
+}
+
+// Prove the staged ROM is retrievable before launching the player,
+// so a serving failure shows a clear message instead of a grey box.
+async function probeEmuRom(romUrl) {
+  const res = await fetch(romUrl);
+  if (!res.ok) throw new Error(`ROM probe HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const { value } = await reader.read();
+  try { reader.cancel(); } catch (e) {}
+  if (!value || !value.length) throw new Error("ROM probe empty");
+}
+
+function createGba(stage, api) {
+  let alive = true;
+
+  const picker = document.createElement("div");
+  picker.className = "emu-picker";
+  picker.innerHTML = `
+    <h4>🕹️ Game Boy Advance</h4>
+    <p>Load a ROM dump you own (homebrew works great). The file never leaves your browser.</p>
+    <input type="file" id="emu-file" accept=".gba,.zip" />
+    <div class="emu-or">— or paste a direct ROM link —</div>
+    <input type="text" id="emu-url" placeholder="https://…/game.gba" autocomplete="off" />
+    <button id="emu-url-btn" class="btn btn-primary">Load URL</button>
+    <p id="emu-status" class="emu-status"></p>
+  `;
+  stage.appendChild(picker);
+
+  const setStatus = (msg) => {
+    const el = picker.querySelector("#emu-status");
+    if (el) el.textContent = msg;
+  };
+
+  function showPicker() {
+    killEmu();
+    stage.querySelector("#emu-holder")?.remove();
+    picker.classList.remove("hidden");
+    picker.style.display = "";
+    setStatus("");
+  }
+
+  function startEmu(romUrl, label) {
+    if (!alive) return;
+    killEmu();
+    stage.querySelector("#emu-holder")?.remove();
+
+    picker.style.display = "none";
+    const holder = document.createElement("div");
+    holder.id = "emu-holder";
+    holder.innerHTML = `
+      <div id="emu-game"></div>
+      <p class="emu-rom">Playing: ${gbaEsc(label)}</p>
+      <button id="emu-change" class="btn btn-ghost">Change ROM</button>
+    `;
+    stage.appendChild(holder);
+    holder.querySelector("#emu-change").addEventListener("click", showPicker);
+
+    window.EJS_player = "#emu-game";
+    window.EJS_gameUrl = romUrl;
+    window.EJS_core = "gba";
+    window.EJS_biosUrl = "";
+    window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
+    const s = document.createElement("script");
+    s.src = "https://cdn.emulatorjs.org/stable/data/loader.js";
+    s.dataset.emuLoader = "1";
+    s.onerror = () => {
+      const grid = holder.querySelector("#emu-game");
+      if (grid) grid.innerHTML = '<p class="gif-status">Could not load the emulator. Check your connection and try again.</p>';
+    };
+    document.body.appendChild(s);
+  }
+
+  picker.querySelector("#emu-file").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file || !alive) return;
+    if (!("serviceWorker" in navigator) || !window.caches || !location.href.startsWith("https://")) {
+      setStatus("Uploads need the hosted https site — or paste a direct ROM link instead.");
+      return;
+    }
+    setStatus("Staging ROM…");
+    try {
+      const safeName = (file.name.replace(/[^a-zA-Z0-9.\-_]/g, "_") || "game.gba").slice(0, 80);
+      const romUrl = new URL(`./emu-rom/${Date.now()}-${safeName}`, location.href).href;
+      const buf = await file.arrayBuffer();
+      const cache = await caches.open("vibechat-emu-roms");
+      await cache.put(romUrl, new Response(buf));
+      await gbaForgetCached();
+      gbaCachedUrl = romUrl;
+      setStatus("Starting player…");
+      await ensureEmuSW(romUrl);
+      await probeEmuRom(romUrl);
+      if (!alive) return;
+      setStatus("");
+      startEmu(romUrl, file.name);
+    } catch (err) {
+      console.error("ROM staging failed:", err, "| workers:", emuDiagLine);
+      const msg = /probe|service worker|SW|controller|redundant|activation|scope/i.test(err?.message || "")
+        ? "Player can't reach the staged ROM — open F12 Console and send me the red lines."
+        : "Could not stage that file — try a direct ROM link instead.";
+      setStatus(msg);
+    }
+  });
+  const loadUrl = () => {
+    const url = picker.querySelector("#emu-url").value.trim();
+    if (!url) return;
+    const label = url.split("/").pop().split("?")[0] || url;
+    startEmu(url, label);
+  };
+  picker.querySelector("#emu-url-btn").addEventListener("click", loadUrl);
+  picker.querySelector("#emu-url").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      loadUrl();
+    }
+  });
+
+  return {
+    destroy() {
+      alive = false;
+      killEmu();
+      gbaForgetCached();
+    }
+  };
+}
+
 const GAMES = {
   wave: { name: "Wave", icon: "🌊", create: createWave },
   flappy: { name: "Flappy Bird", icon: "🐤", create: createFlappy },
   snake: { name: "Snake", icon: "🐍", create: createSnake },
   breakout: { name: "Breakout", icon: "🧱", create: createBreakout },
-  memory: { name: "Memory Match", icon: "🃏", create: createMemory }
+  memory: { name: "Memory Match", icon: "🃏", create: createMemory },
+  gba: { name: "GBA Emulator", icon: "🕹️", create: createGba }
 };

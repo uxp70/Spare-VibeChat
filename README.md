@@ -18,10 +18,20 @@ A chill place to hang out and chat in real time.
 - 🟢 See who's online in each room
 - ⌨️ Typing indicators
 - 🖼️ Profile pictures, username & password changes
+- 🪙 Game coins + avatar frames shop
+- 🏷️ Custom nameplates (1000 unlock, 100–800 themes)
+- 📝 Profile bios (click any avatar to view)
+- 🤝 Friends with requests
+- 💬 Direct messages with unread badges
+- 🚪 Real room membership — join/leave, saved room passwords
 - 📣 @mentions + owner-only @everyone, with unread badges
+- ↩️ Message replies that ping the author
+- 🎬 GIFs (Giphy)
 - 🔔 Browser notifications for mentions & announcements
 - 📌 Announcements tab (owner posts, everyone reads)
 - 🎮 Minigames with leaderboards
+- 🕹️ GBA emulator (bring your own ROM)
+- 🔊 Voice rooms (WebRTC mesh + screen share)
 - 🗑️ Mods can delete messages right from chat
 - 🌙 Dark mode built in
 - 🎨 Colour themes (including light mode)
