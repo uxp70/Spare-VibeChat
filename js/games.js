@@ -12,7 +12,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
 // Coins per score point, per game (scores live on very different scales)
-const COIN_RATES = { flappy: 2, snake: 2, breakout: 0.1, memory: 0.05, wave: 1 };
+const COIN_RATES = { flappy: 2, snake: 2, breakout: 0.1, memory: 0.05, wave: 1, tetris: 0.02, game2048: 0.005, pong: 3 };
 
 let activeGame = null;
 
@@ -174,7 +174,7 @@ function createWave(stage, api) {
       last = { x: last.x + 8, top: gapY - gapHalf, bottom: gapY + gapHalf };
       segs.push(last);
     }
-    py += holding ? -3.4 : 3.4;
+    py += holding ? -speed : speed; // true GD 45° angles at any speed
     trail.push({ x: PX, y: py });
     if (trail.length > 42) trail.shift();
     const score = Math.floor(dist / 50);
@@ -195,9 +195,13 @@ function createWave(stage, api) {
   }
 
   function draw() {
-    ctx.fillStyle = "#0f0f13";
+    // Deep-space background with a faint blue grid
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#070b18");
+    bg.addColorStop(1, "#04060d");
+    ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
-    ctx.strokeStyle = "rgba(124,108,240,0.12)";
+    ctx.strokeStyle = "rgba(0, 140, 255, 0.10)";
     ctx.lineWidth = 1;
     const off = -(dist % 40);
     ctx.beginPath();
@@ -205,8 +209,15 @@ function createWave(stage, api) {
       ctx.moveTo(x, 0);
       ctx.lineTo(x, H);
     }
+    for (let y = 0; y < H; y += 40) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+    }
     ctx.stroke();
-    ctx.fillStyle = "#1e1e28";
+    // Solid GD-style blocks with a soft glow
+    ctx.fillStyle = "#f2f5ff";
+    ctx.shadowColor = "rgba(160, 200, 255, 0.55)";
+    ctx.shadowBlur = 12;
     ctx.beginPath();
     ctx.moveTo(-8, -8);
     for (const s of segs) ctx.lineTo(s.x, s.top);
@@ -219,23 +230,40 @@ function createWave(stage, api) {
     ctx.lineTo(W + 8, H + 8);
     ctx.closePath();
     ctx.fill();
-    ctx.strokeStyle = "#e055e0";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    segs.forEach((s, i) => (i === 0 ? ctx.moveTo(s.x, s.top) : ctx.lineTo(s.x, s.top)));
-    ctx.stroke();
-    ctx.beginPath();
-    segs.forEach((s, i) => (i === 0 ? ctx.moveTo(s.x, s.bottom) : ctx.lineTo(s.x, s.bottom)));
-    ctx.stroke();
-    for (let i = 0; i < trail.length; i++) {
-      const t = trail[i];
-      ctx.fillStyle = `rgba(78,205,196,${(i / trail.length) * 0.8})`;
-      ctx.fillRect(t.x - 2, t.y - 2, 4, 4);
+    ctx.shadowBlur = 0;
+    // Glowing trail ribbon, fading toward the tail
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (let i = 1; i < trail.length; i++) {
+      ctx.strokeStyle = `rgba(0, 229, 255, ${(i / trail.length) * 0.85})`;
+      ctx.lineWidth = 9;
+      ctx.beginPath();
+      ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+      ctx.lineTo(trail[i].x, trail[i].y);
+      ctx.stroke();
     }
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(PX - 6, py - 6, 12, 12);
-    ctx.fillStyle = "#4ecdc4";
-    ctx.fillRect(PX - 4, py - 4, 8, 8);
+    // Arrow player that flips with direction, white core + cyan glow
+    const dir = holding ? -1 : 1;
+    ctx.save();
+    ctx.translate(PX, py);
+    ctx.shadowColor = "#00e5ff";
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    if (dir < 0) {
+      ctx.moveTo(11, -4);
+      ctx.lineTo(-9, -12);
+      ctx.lineTo(-4, 0);
+      ctx.lineTo(-9, 12);
+    } else {
+      ctx.moveTo(11, 4);
+      ctx.lineTo(-9, 12);
+      ctx.lineTo(-4, 0);
+      ctx.lineTo(-9, -12);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
     if (state === "ready") overlayText(ctx, W, H, ["Get Ready", "Hold to rise, release to fall"]);
     else if (state === "over") overlayText(ctx, W, H, ["Wrecked", `Score: ${lastScore}`, "Hold to retry"]);
   }
@@ -517,7 +545,12 @@ function createSnake(stage, api) {
 
   reset();
   alive = true;
-  c.addEventListener("pointerdown", () => setDir({ x: 1, y: 0 }));
+  // Tap starts/restarts, but must NOT queue a direction mid-game —
+  // pointerdown fires before touchend, so an unguarded handler would turn
+  // right first and eat the actual swipe (anti-reverse then locks it in).
+  c.addEventListener("pointerdown", () => {
+    if (state !== "play") setDir({ x: 1, y: 0 });
+  });
   c.addEventListener("touchstart", onTouchStart, { passive: true });
   c.addEventListener("touchend", onTouchEnd);
   window.addEventListener("keydown", onKey);
@@ -808,7 +841,9 @@ async function gbaForgetCached() {
 // for control — not just activation.
 let emuDiagLine = "";
 async function ensureEmuSW(romUrl) {
-  const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js");
+  // Versioned URL forces a fresh install (SW update checks can serve a
+  // stale cached copy for up to 24h otherwise).
+  const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js?v=2");
   let worker = reg.installing || reg.waiting || reg.active;
   try {
     await reg.update();
@@ -831,15 +866,8 @@ async function ensureEmuSW(romUrl) {
       worker.addEventListener("statechange", onChange);
     });
   }
-  if (!navigator.serviceWorker.controller) {
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("SW controller timeout")), 15000);
-      navigator.serviceWorker.addEventListener("controllerchange", () => {
-        clearTimeout(timeout);
-        resolve();
-      }, { once: true });
-    });
-  }
+  // Record registrations BEFORE waiting, so the diagnostic line is
+  // always populated even if a later step times out.
   try {
     const regs = await navigator.serviceWorker.getRegistrations();
     emuDiagLine = regs.map(r => `${r.scope} [${r.active?.state || r.installing?.state || r.waiting?.state || "?"}]`).join(" | ") || "none";
@@ -848,6 +876,15 @@ async function ensureEmuSW(romUrl) {
   } catch (err) {
     if (err.message === "SW scope mismatch") throw err;
     /* getRegistrations failed — proceed, probe will tell us */
+  }
+  if (!navigator.serviceWorker.controller) {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("SW controller timeout")), 15000);
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
+    });
   }
 }
 
@@ -976,11 +1013,646 @@ function createGba(stage, api) {
   };
 }
 
+// ============ TETRIS ============
+const TETRIS_PIECES = [
+  { m: [[0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 0], [0, 0, 0, 0]], c: "#00f0f0" },
+  { m: [[1, 0, 0], [1, 1, 1], [0, 0, 0]], c: "#0000f0" },
+  { m: [[0, 0, 1], [1, 1, 1], [0, 0, 0]], c: "#f0a000" },
+  { m: [[1, 1], [1, 1]], c: "#f0f000" },
+  { m: [[0, 1, 1], [1, 1, 0], [0, 0, 0]], c: "#00f000" },
+  { m: [[0, 1, 0], [1, 1, 1], [0, 0, 0]], c: "#a000f0" },
+  { m: [[1, 1, 0], [0, 1, 1], [0, 0, 0]], c: "#f00000" }
+];
+
+function createTetris(stage, api) {
+  const COLS = 10, ROWS = 20, CELL = 24, W = COLS * CELL, H = ROWS * CELL;
+  const wrap = document.createElement("div");
+  wrap.className = "tetris-wrap";
+  const top = document.createElement("div");
+  top.className = "tetris-top";
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  c.className = "game-canvas";
+  const next = document.createElement("canvas");
+  next.width = 96;
+  next.height = 96;
+  next.className = "game-canvas tetris-next";
+  top.appendChild(c);
+  const side = document.createElement("div");
+  side.className = "tetris-side";
+  side.innerHTML = "<div class='tetris-label'>Next</div>";
+  side.appendChild(next);
+  wrap.appendChild(top);
+  wrap.appendChild(side);
+  const pad = document.createElement("div");
+  pad.className = "game-pad";
+  pad.innerHTML = `
+    <button data-k="left">◀</button>
+    <button data-k="rotate">⟳</button>
+    <button data-k="down">⬇</button>
+    <button data-k="drop">⏬</button>
+    <button data-k="right">▶</button>
+  `;
+  wrap.appendChild(pad);
+  stage.appendChild(wrap);
+
+  const ctx = c.getContext("2d");
+  const nctx = next.getContext("2d");
+  let grid, bag, cur, nxt, score, lines, state, timer, alive;
+
+  function newBag() {
+    bag = [0, 1, 2, 3, 4, 5, 6];
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+  }
+
+  function takePiece() {
+    if (!bag.length) newBag();
+    const p = TETRIS_PIECES[bag.pop()];
+    return { m: p.m.map(r => r.slice()), c: p.c, x: 3, y: 0 };
+  }
+
+  function reset() {
+    grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+    newBag();
+    cur = takePiece();
+    nxt = takePiece();
+    score = 0;
+    lines = 0;
+    state = "ready";
+    api.setScore(0);
+  }
+
+  function level() {
+    return Math.floor(lines / 10) + 1;
+  }
+
+  function speed() {
+    return Math.max(70, 600 - (level() - 1) * 50);
+  }
+
+  function collides(m, px, py) {
+    for (let y = 0; y < m.length; y++) {
+      for (let x = 0; x < m[y].length; x++) {
+        if (!m[y][x]) continue;
+        const bx = px + x, by = py + y;
+        if (bx < 0 || bx >= COLS || by >= ROWS) return true;
+        if (by >= 0 && grid[by][bx]) return true;
+      }
+    }
+    return false;
+  }
+
+  function rotateMatrix(m) {
+    const n = m.length;
+    return m.map((row, i) => row.map((_, j) => m[n - 1 - j][i]));
+  }
+
+  function tryRotate() {
+    if (cur.m.length === 2) return; // O piece
+    const r = rotateMatrix(cur.m);
+    for (const dx of [0, -1, 1, -2, 2]) {
+      if (!collides(r, cur.x + dx, cur.y)) {
+        cur.m = r;
+        cur.x += dx;
+        return;
+      }
+    }
+  }
+
+  function stepDown() {
+    if (!collides(cur.m, cur.x, cur.y + 1)) {
+      cur.y++;
+      return true;
+    }
+    lockPiece();
+    return false;
+  }
+
+  function hardDrop() {
+    while (stepDown()) { /* fall through */ }
+  }
+
+  function lockPiece() {
+    for (let y = 0; y < cur.m.length; y++) {
+      for (let x = 0; x < cur.m[y].length; x++) {
+        if (!cur.m[y][x]) continue;
+        const by = cur.y + y;
+        if (by < 0) {
+          die();
+          return;
+        }
+        grid[by][cur.x + x] = cur.c;
+      }
+    }
+    let cleared = 0;
+    for (let y = ROWS - 1; y >= 0; y--) {
+      if (grid[y].every(v => v)) {
+        grid.splice(y, 1);
+        grid.unshift(Array(COLS).fill(null));
+        cleared++;
+        y++;
+      }
+    }
+    if (cleared > 0) {
+      lines += cleared;
+      score += [0, 100, 300, 500, 800][cleared] * level();
+      api.setScore(score);
+    }
+    cur = nxt;
+    nxt = takePiece();
+    if (collides(cur.m, cur.x, cur.y)) die();
+  }
+
+  function die() {
+    state = "over";
+    api.gameOver(score);
+  }
+
+  function tick() {
+    if (!alive) return;
+    if (state === "play") stepDown();
+    draw();
+    timer = setTimeout(tick, speed());
+  }
+
+  function drawCell(g, x, y, color) {
+    g.fillStyle = color;
+    g.fillRect(x * CELL + 1, y * CELL + 1, CELL - 2, CELL - 2);
+  }
+
+  function draw() {
+    ctx.fillStyle = "#0f0f13";
+    ctx.fillRect(0, 0, W, H);
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        if (grid[y][x]) drawCell(ctx, x, y, grid[y][x]);
+      }
+    }
+    cur.m.forEach((row, y) => row.forEach((v, x) => {
+      if (v && cur.y + y >= 0) drawCell(ctx, cur.x + x, cur.y + y, cur.c);
+    }));
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 16px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(`Lv ${level()}  Lines ${lines}`, 8, 20);
+    nctx.fillStyle = "#0f0f13";
+    nctx.fillRect(0, 0, 96, 96);
+    const nm = nxt.m;
+    const scale = nm.length === 4 ? 20 : 24;
+    const offX = (96 - nm.length * scale) / 2;
+    const offY = (96 - nm.length * scale) / 2;
+    nctx.fillStyle = nxt.c;
+    nm.forEach((row, y) => row.forEach((v, x) => {
+      if (v) nctx.fillRect(offX + x * scale + 1, offY + y * scale + 1, scale - 2, scale - 2);
+    }));
+    if (state === "ready") overlayText(ctx, W, H, ["Ready", "Tap / Space to start"]);
+    else if (state === "over") overlayText(ctx, W, H, ["Game Over", `Score: ${score}`, "Tap to restart"]);
+  }
+
+  function press() {
+    if (!alive) return;
+    if (state === "over") {
+      reset();
+      state = "play";
+    } else if (state === "ready") {
+      state = "play";
+    } else {
+      tryRotate();
+    }
+  }
+
+  function move(dx) {
+    if (!alive) return;
+    if (state !== "play") {
+      press();
+      return;
+    }
+    if (!collides(cur.m, cur.x + dx, cur.y)) cur.x += dx;
+  }
+
+  function down() {
+    if (!alive) return;
+    if (state !== "play") {
+      press();
+      return;
+    }
+    stepDown();
+    draw();
+  }
+
+  function onKey(e) {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") { e.preventDefault(); move(-1); }
+    else if (e.code === "ArrowRight" || e.code === "KeyD") { e.preventDefault(); move(1); }
+    else if (e.code === "ArrowDown" || e.code === "KeyS") { e.preventDefault(); down(); }
+    else if (e.code === "ArrowUp" || e.code === "KeyX" || e.code === "KeyW") { e.preventDefault(); press(); }
+    else if (e.code === "Space") {
+      e.preventDefault();
+      if (state === "play") {
+        hardDrop();
+        draw();
+      } else press();
+    }
+  }
+
+  let touchStart = null;
+  function onTouchStart(e) {
+    touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }
+  function onTouchEnd(e) {
+    if (!touchStart) return;
+    const dx = e.changedTouches[0].clientX - touchStart.x;
+    const dy = e.changedTouches[0].clientY - touchStart.y;
+    touchStart = null;
+    if (Math.abs(dx) < 24 && Math.abs(dy) < 24) {
+      press();
+      return;
+    }
+    if (Math.abs(dx) > Math.abs(dy)) move(dx > 0 ? 1 : -1);
+    else if (dy > 0) down();
+  }
+
+  pad.querySelectorAll("button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const k = btn.dataset.k;
+      if (k === "left") move(-1);
+      else if (k === "right") move(1);
+      else if (k === "rotate") press();
+      else if (k === "down") down();
+      else if (k === "drop") {
+        if (state === "play") {
+          hardDrop();
+          draw();
+        } else press();
+      }
+    });
+  });
+
+  reset();
+  alive = true;
+  c.addEventListener("touchstart", onTouchStart, { passive: true });
+  c.addEventListener("touchend", onTouchEnd);
+  window.addEventListener("keydown", onKey);
+  tick();
+
+  return {
+    destroy() {
+      alive = false;
+      clearTimeout(timer);
+      window.removeEventListener("keydown", onKey);
+      c.removeEventListener("touchstart", onTouchStart);
+      c.removeEventListener("touchend", onTouchEnd);
+    }
+  };
+}
+
+// ============ 2048 ============
+const TILE_COLORS = {
+  2: "#3a3a4a", 4: "#4a4a5e", 8: "#f07830", 16: "#f09040",
+  32: "#e05555", 64: "#d04040", 128: "#f0c060", 256: "#eeb040",
+  512: "#4ecdc4", 1024: "#3aa8e0", 2048: "#7c6cf0"
+};
+
+function create2048(stage, api) {
+  const N = 4, W = 400, CELL = W / N;
+  const c = makeCanvas(stage, W, W);
+  const ctx = c.getContext("2d");
+  let grid, score, state, alive;
+
+  function reset() {
+    grid = Array.from({ length: N }, () => Array(N).fill(0));
+    score = 0;
+    state = "ready";
+    spawn();
+    spawn();
+    api.setScore(0);
+  }
+
+  function emptyCells() {
+    const cells = [];
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        if (!grid[y][x]) cells.push({ x, y });
+      }
+    }
+    return cells;
+  }
+
+  function spawn() {
+    const cells = emptyCells();
+    if (!cells.length) return;
+    const cell = cells[Math.floor(Math.random() * cells.length)];
+    grid[cell.y][cell.x] = Math.random() < 0.9 ? 2 : 4;
+  }
+
+  function slide(row) {
+    const tiles = row.filter(v => v);
+    for (let i = 0; i < tiles.length - 1; i++) {
+      if (tiles[i] === tiles[i + 1]) {
+        tiles[i] *= 2;
+        score += tiles[i];
+        tiles.splice(i + 1, 1);
+      }
+    }
+    while (tiles.length < N) tiles.push(0);
+    return tiles;
+  }
+
+  function move(dx, dy) {
+    if (!alive) return;
+    if (state === "over") {
+      reset();
+      state = "play";
+      draw();
+      return;
+    }
+    if (state === "ready") state = "play";
+    const before = JSON.stringify(grid);
+    for (let i = 0; i < N; i++) {
+      if (dx === -1) grid[i] = slide(grid[i]);
+      else if (dx === 1) grid[i] = slide(grid[i].slice().reverse()).reverse();
+      else if (dy === -1) {
+        const col = slide([grid[0][i], grid[1][i], grid[2][i], grid[3][i]]);
+        for (let y = 0; y < N; y++) grid[y][i] = col[y];
+      } else if (dy === 1) {
+        const col = slide([grid[3][i], grid[2][i], grid[1][i], grid[0][i]]).reverse();
+        for (let y = 0; y < N; y++) grid[y][i] = col[y];
+      }
+    }
+    if (JSON.stringify(grid) === before) return;
+    api.setScore(score);
+    spawn();
+    draw();
+    if (!movesAvailable()) {
+      state = "over";
+      api.gameOver(score);
+      draw();
+    }
+  }
+
+  function movesAvailable() {
+    if (emptyCells().length) return true;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        if ((x + 1 < N && grid[y][x] === grid[y][x + 1]) ||
+            (y + 1 < N && grid[y][x] === grid[y + 1][x])) return true;
+      }
+    }
+    return false;
+  }
+
+  function draw() {
+    ctx.fillStyle = "#0f0f13";
+    ctx.fillRect(0, 0, W, W);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const v = grid[y][x];
+        ctx.fillStyle = v ? (TILE_COLORS[v] || "#7c6cf0") : "#1e1e28";
+        const px = x * CELL + 5, py = y * CELL + 5, s = CELL - 10;
+        if (ctx.roundRect) {
+          ctx.beginPath();
+          ctx.roundRect(px, py, s, s, 8);
+          ctx.fill();
+        } else {
+          ctx.fillRect(px, py, s, s);
+        }
+        if (v) {
+          ctx.fillStyle = "#fff";
+          ctx.font = `bold ${v < 100 ? 34 : v < 1000 ? 28 : 22}px 'Segoe UI', system-ui, sans-serif`;
+          ctx.fillText(v, x * CELL + CELL / 2, y * CELL + CELL / 2 + 1);
+        }
+      }
+    }
+    ctx.textBaseline = "alphabetic";
+    if (state === "ready") overlayText(ctx, W, W, ["Ready", "Arrows / WASD / swipe"]);
+    else if (state === "over") overlayText(ctx, W, W, ["Game Over", `Score: ${score}`, "Tap / Space to restart"]);
+  }
+
+  function onKey(e) {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") { e.preventDefault(); move(-1, 0); }
+    else if (e.code === "ArrowRight" || e.code === "KeyD") { e.preventDefault(); move(1, 0); }
+    else if (e.code === "ArrowUp" || e.code === "KeyW") { e.preventDefault(); move(0, -1); }
+    else if (e.code === "ArrowDown" || e.code === "KeyS") { e.preventDefault(); move(0, 1); }
+    else if (e.code === "Space" && state === "over") {
+      e.preventDefault();
+      move(0, 0);
+    }
+  }
+
+  let touchStart = null;
+  function onTouchStart(e) {
+    touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }
+  function onTouchEnd(e) {
+    if (!touchStart) return;
+    const dx = e.changedTouches[0].clientX - touchStart.x;
+    const dy = e.changedTouches[0].clientY - touchStart.y;
+    touchStart = null;
+    if (Math.abs(dx) < 24 && Math.abs(dy) < 24) {
+      if (state !== "play") move(0, 0);
+      return;
+    }
+    if (Math.abs(dx) > Math.abs(dy)) move(dx > 0 ? 1 : -1, 0);
+    else move(0, dy > 0 ? 1 : -1);
+  }
+
+  reset();
+  alive = true;
+  draw();
+  c.addEventListener("touchstart", onTouchStart, { passive: true });
+  c.addEventListener("touchend", onTouchEnd);
+  window.addEventListener("keydown", onKey);
+
+  return {
+    destroy() {
+      alive = false;
+      window.removeEventListener("keydown", onKey);
+      c.removeEventListener("touchstart", onTouchStart);
+      c.removeEventListener("touchend", onTouchEnd);
+    }
+  };
+}
+
+// ============ PONG VS AI ============
+function createPong(stage, api) {
+  const W = 400, H = 520;
+  const c = makeCanvas(stage, W, H);
+  const ctx = c.getContext("2d");
+  const PW = 80, PH = 10, BR = 7, WIN_SCORE = 7;
+  let playerX, aiX, ball, playerScore, aiScore, state, raf, alive, keys, aiTarget;
+
+  function reset(full) {
+    playerX = W / 2;
+    aiX = W / 2;
+    if (full) {
+      playerScore = 0;
+      aiScore = 0;
+      api.setScore(0);
+    }
+    serve(playerScore >= aiScore ? 1 : -1);
+    state = full ? "ready" : state;
+  }
+
+  function serve(dirY) {
+    ball = { x: W / 2, y: H / 2, vx: (Math.random() < 0.5 ? -1 : 1) * 2.5, vy: 3.5 * dirY };
+    aiTarget = W / 2 + (Math.random() - 0.5) * 60;
+  }
+
+  function die(playerWonPoint) {
+    if (playerWonPoint) {
+      playerScore++;
+      api.setScore(playerScore);
+    } else {
+      aiScore++;
+    }
+    if (playerScore >= WIN_SCORE || aiScore >= WIN_SCORE) {
+      state = "over";
+      api.gameOver(playerScore);
+    } else {
+      serve(playerWonPoint ? -1 : 1);
+    }
+  }
+
+  function update() {
+    if (keys.has("left")) playerX = Math.max(PW / 2, playerX - 6);
+    if (keys.has("right")) playerX = Math.min(W - PW / 2, playerX + 6);
+    // AI tracks the ball with limited speed and aim error
+    if (ball.vy < 0) {
+      const diff = (aiTarget + (ball.x - aiTarget) * 0.4) - aiX;
+      aiX += Math.max(-3.2, Math.min(3.2, diff));
+      aiX = Math.max(PW / 2, Math.min(W - PW / 2, aiX));
+    }
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    if (ball.x - BR < 0 || ball.x + BR > W) ball.vx *= -1;
+    // Player paddle (bottom)
+    if (ball.vy > 0 && ball.y + BR >= H - 30 && ball.y + BR <= H - 30 + PH + 6 &&
+        Math.abs(ball.x - playerX) <= PW / 2 + BR) {
+      const off = (ball.x - playerX) / (PW / 2);
+      ball.vx = off * 4.5;
+      ball.vy = -Math.abs(ball.vy) * 1.04;
+      ball.y = H - 30 - BR - 1;
+    }
+    // AI paddle (top)
+    if (ball.vy < 0 && ball.y - BR <= 30 && ball.y - BR >= 30 - PH - 6 &&
+        Math.abs(ball.x - aiX) <= PW / 2 + BR) {
+      const off = (ball.x - aiX) / (PW / 2);
+      ball.vx = off * 4.5;
+      ball.vy = Math.abs(ball.vy) * 1.04;
+      ball.y = 30 + BR + 1;
+    }
+    if (ball.y - BR > H) {
+      aiTarget = W / 2 + (Math.random() - 0.5) * 60;
+      die(false);
+    } else if (ball.y + BR < 0) {
+      aiTarget = W / 2 + (Math.random() - 0.5) * 60;
+      die(true);
+    }
+  }
+
+  function draw() {
+    ctx.fillStyle = "#0f0f13";
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "#2a2a38";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(0, H / 2);
+    ctx.lineTo(W, H / 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#7c6cf0";
+    ctx.fillRect(aiX - PW / 2, 24 - PH / 2, PW, PH);
+    ctx.fillStyle = "#4ecdc4";
+    ctx.fillRect(playerX - PW / 2, H - 30 - PH / 2, PW, PH);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, BR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = "bold 40px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#9898b0";
+    ctx.fillText(aiScore, W / 2, H / 2 - 30);
+    ctx.fillText(playerScore, W / 2, H / 2 + 60);
+    if (state === "ready") overlayText(ctx, W, H, ["Ready", "First to 7 wins", "Tap to serve"]);
+    else if (state === "over") overlayText(ctx, W, H, [
+      playerScore > aiScore ? "You Win!" : "AI Wins",
+      `You ${playerScore} — ${aiScore} AI`,
+      "Tap to play again"
+    ]);
+  }
+
+  function loop() {
+    if (!alive) return;
+    if (state === "play") update();
+    draw();
+    raf = requestAnimationFrame(loop);
+  }
+
+  function press() {
+    if (!alive) return;
+    if (state === "over") {
+      reset(true);
+      state = "play";
+    } else if (state === "ready") {
+      state = "play";
+    }
+  }
+
+  function onKeyDown(e) {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") { keys.add("left"); e.preventDefault(); }
+    if (e.code === "ArrowRight" || e.code === "KeyD") { keys.add("right"); e.preventDefault(); }
+    if (e.code === "Space") { e.preventDefault(); press(); }
+  }
+  function onKeyUp(e) {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.delete("left");
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.delete("right");
+  }
+  function onPointer(e) {
+    const rect = c.getBoundingClientRect();
+    const clientX = e.clientX ?? (e.touches && e.touches[0]?.clientX);
+    if (clientX == null) {
+      press();
+      return;
+    }
+    playerX = Math.max(PW / 2, Math.min(W - PW / 2, (clientX - rect.left) * (W / rect.width)));
+    if (state !== "play") press();
+  }
+
+  reset(true);
+  alive = true;
+  keys = new Set();
+  c.addEventListener("pointerdown", onPointer);
+  c.addEventListener("pointermove", (e) => {
+    if (e.buttons > 0 || e.pointerType === "touch") onPointer(e);
+  });
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+  loop();
+
+  return {
+    destroy() {
+      alive = false;
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    }
+  };
+}
+
 const GAMES = {
   wave: { name: "Wave", icon: "🌊", create: createWave },
   flappy: { name: "Flappy Bird", icon: "🐤", create: createFlappy },
   snake: { name: "Snake", icon: "🐍", create: createSnake },
   breakout: { name: "Breakout", icon: "🧱", create: createBreakout },
   memory: { name: "Memory Match", icon: "🃏", create: createMemory },
-  gba: { name: "GBA Emulator", icon: "🕹️", create: createGba }
+  gba: { name: "GBA Emulator", icon: "🕹️", create: createGba },
+  tetris: { name: "Tetris", icon: "🟪", create: createTetris },
+  game2048: { name: "2048", icon: "🔢", create: create2048 },
+  pong: { name: "Pong", icon: "🏓", create: createPong }
 };

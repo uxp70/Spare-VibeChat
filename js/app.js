@@ -329,6 +329,29 @@ function formatTime(ts) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function dayLabel(ts) {
+  const now = new Date();
+  const d = new Date(ts);
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfThatDay = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((startOfToday - startOfThatDay) / 86400000);
+  if (diffDays <= 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    ...(d.getFullYear() === now.getFullYear() ? {} : { year: "numeric" })
+  });
+}
+
+// Full header stamp: time alone today, "Yesterday · 02:33 PM" style otherwise
+function formatFullTime(ts) {
+  if (!ts) return "";
+  const label = dayLabel(Number(ts) || Date.now());
+  const time = formatTime(ts);
+  return label === "Today" ? time : `${label} · ${time}`;
+}
+
 function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
@@ -1170,7 +1193,7 @@ function appendMessage(msgId, msg) {
       <span class="avatar" data-uid="${escapeHtml(msg.uid)}" data-name="${escapeHtml(msg.username)}">${avatarInner(msg.username, (userCache[msg.uid] || {}).photoURL)}</span>
       <span class="message-username">${escapeHtml(msg.username)}</span>
       ${isMsgAdmin ? '<span class="message-admin-badge">ADMIN</span>' : isMsgOwner ? '<span class="message-admin-badge">OWNER</span>' : ""} ${plateHtml(msg.uid)}
-      <span class="message-time">${formatTime(msg.timestamp)}</span>
+      <span class="message-time">${formatFullTime(msg.timestamp)}</span>
     </div>
     <div class="message-bubble">${msg.replyTo ? `<div class="reply-quote" data-goto="${escapeHtml(msg.replyTo.msgId)}"><span class="reply-author">@${escapeHtml(msg.replyTo.username)}</span><span>${escapeHtml((msg.replyTo.text || "").slice(0, 120))}</span></div>` : ""}${renderMessageText(msg.text, isOwnerName(msg.username))}${msg.imageUrl ? `<a href="${escapeHtml(msg.imageUrl)}" target="_blank" rel="noopener"><img src="${escapeHtml(msg.imageUrl)}" class="message-image" loading="lazy" alt="shared image" /></a>` : ""}${msg.fileUrl ? `<a href="${escapeHtml(msg.fileUrl)}" target="_blank" rel="noopener" download="${escapeHtml(msg.fileName || "file")}" class="file-link">📎 ${escapeHtml(msg.fileName || "Download file")}</a>` : ""}</div>
   `;
@@ -2316,7 +2339,7 @@ function appendAnnouncement(msgId, msg) {
       <span class="avatar" data-uid="${escapeHtml(msg.uid)}" data-name="${escapeHtml(msg.username)}">${avatarInner(msg.username, (userCache[msg.uid] || {}).photoURL)}</span>
       <span class="message-username">${escapeHtml(msg.username)}</span>
       ${isMsgAdmin ? '<span class="message-admin-badge">ADMIN</span>' : isMsgOwner ? '<span class="message-admin-badge">OWNER</span>' : ""} ${plateHtml(msg.uid)}
-      <span class="message-time">${formatTime(msg.timestamp)}</span>
+      <span class="message-time">${formatFullTime(msg.timestamp)}</span>
     </div>
     <div class="message-bubble">${renderMessageText(msg.text, isOwnerName(msg.username))}</div>
   `;
@@ -2550,7 +2573,7 @@ async function registerPushToken() {
     if (!VAPID_KEY || VAPID_KEY === "YOUR_VAPID_KEY") return;
     if (!currentUser || Notification.permission !== "granted") return;
     const { getMessaging, getToken } = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging.js");
-    const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js");
+    const reg = await navigator.serviceWorker.register("firebase-messaging-sw.js?v=2");
     const token = await getToken(getMessaging(), { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
     if (!token) return;
     const snap = await get(ref(db, `pushTokens/${currentUser.uid}`));
@@ -2908,7 +2931,7 @@ function appendDmMessage(msgId, msg) {
       <span class="avatar" data-uid="${escapeHtml(msg.uid)}" data-name="${escapeHtml(msg.username)}">${avatarInner(msg.username, (userCache[msg.uid] || {}).photoURL)}</span>
       <span class="message-username">${escapeHtml(msg.username)}</span>
       ${isMsgAdmin ? '<span class="message-admin-badge">ADMIN</span>' : isMsgOwner ? '<span class="message-admin-badge">OWNER</span>' : ""} ${plateHtml(msg.uid)}
-      <span class="message-time">${formatTime(msg.timestamp)}</span>
+      <span class="message-time">${formatFullTime(msg.timestamp)}</span>
     </div>
     <div class="message-bubble">${renderMessageText(msg.text, isOwnerName(msg.username))}</div>
   `;
