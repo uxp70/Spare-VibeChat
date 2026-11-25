@@ -23,7 +23,7 @@ messaging.onBackgroundMessage((payload) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  event.waitUntil(clients.openWindow("https://venulousthyduckulous.github.io/vibechat/"));
+  event.waitUntil(clients.openWindow(new URL("./", self.location).href));
 });
 
 // NOTE: bump the ?v= query in BOTH registration call sites

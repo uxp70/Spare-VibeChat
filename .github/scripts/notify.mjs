@@ -4,7 +4,7 @@ import { GoogleAuth } from "google-auth-library";
 
 const PROJECT_ID = "vibechat-a2d59";
 const DB_URL = `https://${PROJECT_ID}-default-rtdb.firebaseio.com`;
-const APP_URL = "https://venulousthyduckulous.github.io/vibechat/";
+const APP_URL = "https://uxp70.github.io/Spare-VibeChat/";
 const MAX_SENDS = 50;
 
 const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");

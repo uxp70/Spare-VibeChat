@@ -2,7 +2,7 @@
 
 A chill place to hang out and chat in real time.
 
-**Live at: https://venulousthyduckulous.github.io/vibechat/**
+**Live at: https://uxp70.github.io/Spare-VibeChat/**
 
 ## Get the app
 
